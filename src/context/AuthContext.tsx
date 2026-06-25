@@ -1,0 +1,396 @@
+"use client";
+
+import { clearRecentViewsStorage } from "@/hooks/use-recent-views";
+import { ApiError, authService, userService } from "@/services/api";
+import { signOut, useSession } from "next-auth/react";
+import React, { createContext, startTransition, useContext, useEffect, useState } from "react";
+import { toast } from "sonner";
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  avatar?: string;
+  token?: string;
+}
+
+export interface SignupData {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  password: string;
+  conf_password: string;
+}
+
+export interface ValidationError {
+  fieldErrors?: Record<string, string[]>;
+  message: string;
+}
+
+interface AuthContextType {
+  user: User | null;
+  isAuthenticated: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  signup: (signupData: SignupData) => Promise<void>;
+  logout: () => Promise<void>;
+  socialLogin: (provider: "google" | "facebook") => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [user, setUser] = useState<User | null>(null);
+  const { data: session } = useSession();
+
+  useEffect(() => {
+    const savedUser = localStorage.getItem("hometex-user");
+    if (savedUser) {
+      startTransition(() => {
+        setUser(JSON.parse(savedUser));
+      });
+    }
+  }, []);
+
+  // Sync NextAuth session with local auth context
+  useEffect(() => {
+    if (session?.user && session.user.email) {
+      const sessionWithToken = session as unknown as Record<string, unknown>;
+      // eslint-disable-next-line no-console
+      console.log("[AuthContext] Session detected:", {
+        hasBackendToken: !!sessionWithToken.backendToken,
+        hasAccessToken: !!sessionWithToken.accessToken,
+        backendTokenLength: (sessionWithToken.backendToken as string)?.length || 0,
+        backendTokenPreview: (sessionWithToken.backendToken as string)?.substring(0, 15),
+        accessTokenLength: (sessionWithToken.accessToken as string)?.length || 0,
+        accessTokenPreview: (sessionWithToken.accessToken as string)?.substring(0, 15),
+      });
+
+      // Use backendId if available (from Google OAuth), otherwise use session user ID
+      const userId = sessionWithToken.backendId
+        ? String(sessionWithToken.backendId)
+        : session.user.id || `google-${Date.now()}`;
+
+      // Use backendToken (the JWT from our API) instead of accessToken (Google OAuth token)
+      const backendToken =
+        (sessionWithToken.backendToken as string) || (sessionWithToken.accessToken as string);
+
+      // eslint-disable-next-line no-console
+      console.log("[AuthContext] Selected token to use:", {
+        tokenLength: backendToken?.length || 0,
+        tokenPreview: backendToken?.substring(0, 15),
+        isBackendToken: !!sessionWithToken.backendToken,
+        isGoogleToken: backendToken?.startsWith("ya29"),
+      });
+
+      const googleUser: User = {
+        id: userId,
+        email: session.user.email,
+        name: session.user.name || "",
+        avatar: session.user.image || undefined,
+        token: backendToken,
+      };
+      setUser(googleUser);
+      localStorage.setItem("hometex-user", JSON.stringify(googleUser));
+      if (backendToken) {
+        localStorage.setItem("hometex-auth-token", backendToken);
+        // eslint-disable-next-line no-console
+        console.log("[AuthContext] Token stored in localStorage:", {
+          tokenLength: backendToken.length,
+          tokenPreview: backendToken.substring(0, 15),
+          isGoogleToken: backendToken.startsWith("ya29"),
+        });
+      }
+    }
+  }, [session]);
+
+  const login = async (email: string, password: string) => {
+    try {
+      const response = await authService.login({ email, password });
+
+      // Log response for debugging
+      if (process.env.NODE_ENV === "development") {
+        // eslint-disable-next-line no-console
+        console.log("Login response:", response);
+      }
+
+      // Extract token and user data from the response
+      // Handle different response structures
+      let userData: { token?: string; [key: string]: unknown } | null = null;
+      let token: string | undefined = undefined;
+
+      if (response.data) {
+        if (Array.isArray(response.data) && response.data.length > 0) {
+          userData = response.data[0];
+          token = userData?.token;
+        } else if (typeof response.data === "object" && !Array.isArray(response.data)) {
+          // Handle case where data is an object, not an array
+          userData = response.data as { token?: string; [key: string]: unknown };
+          token = (response.data as { token?: string })?.token;
+        }
+      }
+
+      if (!userData || !token) {
+        console.error("Login response structure:", response);
+        throw new Error("Invalid response: user data or token not found");
+      }
+
+      if (!token) {
+        console.error("No token found in login response");
+        toast.error(
+          "Login succeeded but no authentication token received. Please contact support."
+        );
+        throw new Error("No authentication token received");
+      }
+
+      // Create user object from response - ensure ID is properly converted to string
+      const userId = userData.id ? String(userData.id) : null;
+      if (!userId) {
+        throw new Error("Invalid response: user ID not found");
+      }
+
+      const loggedInUser = {
+        id: userId,
+        email: String(userData.email || ""),
+        name: String(
+          userData.name || `${userData.first_name || ""} ${userData.last_name || ""}`.trim()
+        ),
+        token: token,
+      };
+
+      setUser(loggedInUser);
+      localStorage.setItem("hometex-user", JSON.stringify(loggedInUser));
+      localStorage.setItem("hometex-auth-token", token);
+
+      // Debug logging
+      if (typeof window !== "undefined") {
+        // eslint-disable-next-line no-console
+        console.log("[AuthContext Login] Token stored:", {
+          tokenLength: token.length,
+          tokenPreview: token.substring(0, 15),
+          userId: loggedInUser.id,
+          hasToken: !!localStorage.getItem("hometex-auth-token"),
+          isGoogleToken: token.startsWith("ya29"),
+        });
+      }
+
+      toast.success(response.message || "Logged in successfully!");
+    } catch (error) {
+      if (error instanceof Error) {
+        toast.error(error.message);
+      } else {
+        toast.error("Login failed. Please try again.");
+      }
+      throw error;
+    }
+  };
+
+  const signup = async (signupData: SignupData) => {
+    try {
+      const response = await authService.signup(signupData);
+
+      // Log response for debugging
+      if (process.env.NODE_ENV === "development") {
+        // eslint-disable-next-line no-console
+        console.log("Signup response:", response);
+      }
+
+      // Extract token and user data from the response
+      // API returns: { success: { name, authorisation: { token, type }, message } }
+      let token: string | undefined = undefined;
+      let userName: string | undefined = undefined;
+      let message: string | undefined = undefined;
+
+      if (
+        (
+          response as {
+            success?: { authorisation?: { token?: string }; name?: string; message?: string };
+          }
+        ).success
+      ) {
+        const successData = (
+          response as {
+            success: { authorisation?: { token?: string }; name?: string; message?: string };
+          }
+        ).success;
+        token = successData?.authorisation?.token;
+        userName = successData?.name;
+        message = successData?.message;
+      } else if (response.data) {
+        // Fallback to old structure if needed
+        if (Array.isArray(response.data) && response.data.length > 0) {
+          const userData = response.data[0];
+          token = userData?.token;
+          userName = userData?.name;
+        } else if (typeof response.data === "object" && !Array.isArray(response.data)) {
+          const dataObj = response.data as { token?: string; name?: string };
+          token = dataObj?.token;
+          userName = dataObj?.name;
+        }
+        message = response.message;
+      }
+
+      if (!token) {
+        console.error("Signup response structure:", response);
+        throw new Error("Invalid response: authentication token not found");
+      }
+
+      // Try to fetch user profile to get the real customer ID
+      let userId: string = `user-${Date.now()}`; // Fallback temporary ID
+      try {
+        const profileResponse = await userService.getProfile();
+        if (profileResponse.user?.id) {
+          userId = String(profileResponse.user.id);
+        }
+      } catch (profileError) {
+        // If profile fetch fails, use temporary ID - user can still proceed
+        // The checkout page will try to fetch profile again if needed
+        console.warn("Could not fetch user profile after signup:", profileError);
+      }
+
+      // Create user object from response
+      const newUser = {
+        id: userId,
+        email: signupData.email,
+        name: userName || `${signupData.first_name} ${signupData.last_name}`.trim(),
+        token: token,
+      };
+
+      setUser(newUser);
+      localStorage.setItem("hometex-user", JSON.stringify(newUser));
+      localStorage.setItem("hometex-auth-token", token);
+
+      toast.success(message || "Account created successfully!");
+    } catch (error) {
+      const extractError = (err: unknown): string => {
+        if (!err) {
+          return "Signup failed. Please try again.";
+        }
+        const tryParse = (payload: Record<string, unknown>): string | null => {
+          if (payload.errors && typeof payload.errors === "object") {
+            const first = Object.values(payload.errors as Record<string, string[]>)[0];
+            if (first?.[0]) {
+              return first[0];
+            }
+          }
+          if (payload.error && typeof payload.error === "object") {
+            const first = Object.values(payload.error as Record<string, string[]>)[0];
+            if (Array.isArray(first) && first[0]) {
+              return first[0] as string;
+            }
+          }
+          if (payload.message && typeof payload.message === "string") {
+            return payload.message;
+          }
+          return null;
+        };
+
+        if (err instanceof ApiError && err.response && typeof err.response === "object") {
+          const parsed = tryParse(err.response as Record<string, unknown>);
+          if (parsed) {
+            return parsed;
+          }
+        }
+
+        if (err instanceof Error) {
+          return err.message;
+        }
+
+        if (typeof err === "object") {
+          const parsed = tryParse(err as Record<string, unknown>);
+          if (parsed) {
+            return parsed;
+          }
+        }
+
+        return "Signup failed. Please try again.";
+      };
+
+      const errorMessage = extractError(error);
+
+      // Extract field-specific errors for form display
+      let fieldErrors: Record<string, string[]> = {};
+      if (error instanceof ApiError && error.response && typeof error.response === "object") {
+        const response = error.response as Record<string, unknown>;
+        if (response.error && typeof response.error === "object") {
+          fieldErrors = response.error as Record<string, string[]>;
+        } else if (response.errors && typeof response.errors === "object") {
+          fieldErrors = response.errors as Record<string, string[]>;
+        }
+      }
+
+      // Create enhanced error with fieldErrors
+      const enhancedError = Object.assign(new Error(errorMessage), { fieldErrors });
+
+      toast.error(errorMessage);
+      throw enhancedError;
+    }
+  };
+
+  const socialLogin = async (provider: "google" | "facebook") => {
+    // TODO: Replace with actual OAuth flow
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    const mockUser = {
+      id: `user-${Date.now()}`,
+      email: `user@${provider}.com`,
+      name: `${provider} User`,
+    };
+
+    setUser(mockUser);
+    localStorage.setItem("hometex-user", JSON.stringify(mockUser));
+    toast.success(`Logged in with ${provider}`);
+  };
+
+  const logout = async () => {
+    try {
+      // If user is logged in via NextAuth (Google OAuth), sign out from NextAuth
+      if (session?.user) {
+        await signOut({ redirect: false });
+      }
+
+      // Call backend logout
+      await authService.logout();
+    } catch {
+      // ignore API errors on logout
+    } finally {
+      // Clear localStorage FIRST to prevent race conditions with context effects
+      localStorage.removeItem("hometex-user");
+      localStorage.removeItem("hometex-auth-token");
+      localStorage.removeItem("hometex-cart");
+      localStorage.removeItem("hometex-wishlist");
+      localStorage.removeItem("hometex-orders");
+      clearRecentViewsStorage(); // Clear recent views on logout
+
+      // Then clear user state - this will trigger context effects to clear their state
+      setUser(null);
+
+      toast.success("Logged out successfully");
+      // Redirect to home
+      window.location.href = "/";
+    }
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        isAuthenticated: Boolean(user),
+        login,
+        signup,
+        logout,
+        socialLogin,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+};
+
+export const useAuth = () => {
+  const context = useContext(AuthContext);
+  if (!context) {
+    throw new Error("useAuth must be used within AuthProvider");
+  }
+  return context;
+};
